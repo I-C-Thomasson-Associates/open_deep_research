@@ -1,0 +1,11 @@
+services:
+  open-deep-research:
+    container_name: open-deep-research
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "2024:2024"
+    env_file:
+      - .env
+    restart: unless-stopped

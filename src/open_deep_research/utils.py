@@ -87,6 +87,7 @@ async def tavily_search(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
+        temperature=1,
         tags=["langsmith:nostream"]
     ).with_structured_output(Summary).with_retry(
         stop_after_attempt=configurable.max_structured_output_retries
@@ -678,7 +679,7 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
     provider = None
     if model_name:
         model_str = str(model_name).lower()
-        if model_str.startswith('openai:'):
+        if model_str.startswith('openai:') or model_str.startswith('azure_openai:'):
             provider = 'openai'
         elif model_str.startswith('anthropic:'):
             provider = 'anthropic'
@@ -826,6 +827,7 @@ MODEL_TOKEN_LIMITS = {
     "bedrock:us.anthropic.claude-sonnet-4-20250514-v1:0": 200000,
     "bedrock:us.anthropic.claude-opus-4-20250514-v1:0": 200000,
     "anthropic.claude-opus-4-1-20250805-v1:0": 200000,
+    "azure_openai:gpt-5.3-chat": 128000,
 }
 
 def get_model_token_limit(model_string):
@@ -899,6 +901,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return None
         if model_name.startswith("openai:"):
             return api_keys.get("OPENAI_API_KEY")
+        elif model_name.startswith("azure_openai:"):
+            return api_keys.get("AZURE_OPENAI_API_KEY") or api_keys.get("OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return api_keys.get("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
@@ -907,6 +911,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
     else:
         if model_name.startswith("openai:"): 
             return os.getenv("OPENAI_API_KEY")
+        elif model_name.startswith("azure_openai:"):
+            return os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
