@@ -8,10 +8,7 @@ __pycache__/
 *.pyd
 *.swp
 *.swo
-tests/
 examples/
-src/legacy/
-src/security/
 tmp/
 temp/
 .langgraph/
