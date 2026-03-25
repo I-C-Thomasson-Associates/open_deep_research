@@ -1,22 +1,17 @@
-FROM langchain/langgraph-api:3.11
+FROM python:3.11-slim
 
-# -- Adding local package . --
-ADD . /deps/open_deep_research
-# -- End of local package . --
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# -- Installing all local dependencies --
-RUN for dep in /deps/*; do             echo "Installing $dep";             if [ -d "$dep" ]; then                 echo "Installing $dep";                 (cd "$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e .);             fi;         done
-# -- End of local dependencies install --
-ENV LANGSERVE_GRAPHS='{"Deep Researcher": "/deps/open_deep_research/src/open_deep_research/deep_researcher.py:deep_researcher"}'
+WORKDIR /app
 
-# -- Ensure user deps didn't inadvertently overwrite langgraph-api
-RUN mkdir -p /api/langgraph_api /api/langgraph_runtime /api/langgraph_license && touch /api/langgraph_api/__init__.py /api/langgraph_runtime/__init__.py /api/langgraph_license/__init__.py
-RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir --no-deps -e /api
-# -- End of ensuring user deps didn't inadvertently overwrite langgraph-api --
-# -- Removing build deps from the final image ~<:===~~~ --
-RUN pip uninstall -y pip setuptools wheel
-RUN rm -rf /usr/local/lib/python*/site-packages/pip* /usr/local/lib/python*/site-packages/setuptools* /usr/local/lib/python*/site-packages/wheel* && find /usr/local/bin -name "pip*" -delete || true
-RUN rm -rf /usr/lib/python*/site-packages/pip* /usr/lib/python*/site-packages/setuptools* /usr/lib/python*/site-packages/wheel* && find /usr/bin -name "pip*" -delete || true
-RUN uv pip uninstall --system pip setuptools wheel && rm /usr/bin/uv /usr/bin/uvx
+RUN pip install --no-cache-dir uv
 
-WORKDIR /deps/open_deep_research
+COPY . .
+
+RUN uv pip install --system .
+
+EXPOSE 2024
+
+CMD ["python", "-m", "langgraph_api.cli", "--host", "0.0.0.0", "--port", "2024", "--no-reload", "--config", "langgraph.json", "--runtime-edition", "inmem"]
