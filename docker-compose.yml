@@ -8,10 +8,4 @@ services:
       - "2024:2024"
     env_file:
       - .env
-    networks:
-      - openwebui_default
     restart: unless-stopped
-
-networks:
-  openwebui_default:
-    external: true
