@@ -78,6 +78,7 @@ class SupervisorState(TypedDict):
     research_brief: str
     notes: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0
+    conduct_research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
 
 class ResearcherState(TypedDict):
@@ -85,6 +86,7 @@ class ResearcherState(TypedDict):
     
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
     tool_call_iterations: int = 0
+    search_tool_call_count: int = 0
     research_topic: str
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []

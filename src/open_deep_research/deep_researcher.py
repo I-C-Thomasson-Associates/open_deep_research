@@ -57,6 +57,21 @@ configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key", "temperature"),
 )
 
+
+def _min_conduct_research_calls(max_researcher_iterations: int) -> int:
+    """Infer minimum ConductResearch calls from configured iteration ceiling.
+
+    This keeps behavior level-aware without requiring a separate explicit level field:
+    - max 1 (Quick Scan) -> min 1
+    - max 2-3 (Standard) -> min 2
+    - max >=5 (Deep Dive) -> min 3
+    """
+    if max_researcher_iterations <= 1:
+        return 1
+    if max_researcher_iterations <= 3:
+        return 2
+    return 3
+
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
     
@@ -159,7 +174,10 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     supervisor_system_prompt = lead_researcher_prompt.format(
         date=get_today_str(),
         max_concurrent_research_units=configurable.max_concurrent_research_units,
-        max_researcher_iterations=configurable.max_researcher_iterations
+        max_researcher_iterations=configurable.max_researcher_iterations,
+        min_conduct_research_calls=_min_conduct_research_calls(
+            configurable.max_researcher_iterations
+        ),
     )
     
     return Command(
@@ -244,18 +262,25 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     configurable = Configuration.from_runnable_config(config)
     supervisor_messages = state.get("supervisor_messages", [])
     research_iterations = state.get("research_iterations", 0)
+    conduct_research_iterations = state.get("conduct_research_iterations", 0)
     most_recent_message = supervisor_messages[-1]
-    
-    # Define exit criteria for research phase
-    exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
-    no_tool_calls = not most_recent_message.tool_calls
-    research_complete_tool_call = any(
-        tool_call["name"] == "ResearchComplete" 
-        for tool_call in most_recent_message.tool_calls
+    max_conduct_research_calls = max(1, int(configurable.max_researcher_iterations))
+    min_conduct_research_calls = min(
+        _min_conduct_research_calls(max_conduct_research_calls),
+        max_conduct_research_calls,
     )
-    
-    # Exit if any termination condition is met
-    if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
+
+    # Define exit criteria for research phase
+    exceeded_allowed_iterations = (
+        conduct_research_iterations >= max_conduct_research_calls
+    )
+    exceeded_loop_guard = research_iterations > max_conduct_research_calls * 4
+    no_tool_calls = not most_recent_message.tool_calls
+
+    can_complete = conduct_research_iterations >= min_conduct_research_calls
+
+    # Exit only when ceilings are reached or completion criteria are satisfied.
+    if exceeded_allowed_iterations or exceeded_loop_guard:
         return Command(
             goto=END,
             update={
@@ -263,10 +288,38 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 "research_brief": state.get("research_brief", "")
             }
         )
+
+    if no_tool_calls:
+        if can_complete:
+            return Command(
+                goto=END,
+                update={
+                    "notes": get_notes_from_tool_calls(supervisor_messages),
+                    "research_brief": state.get("research_brief", "")
+                }
+            )
+        return Command(
+            goto="supervisor",
+            update={
+                "supervisor_messages": [
+                    HumanMessage(
+                        content=(
+                            f"Continue research. You have only delegated ConductResearch "
+                            f"{conduct_research_iterations} time(s), but this run requires at least "
+                            f"{min_conduct_research_calls} ConductResearch delegations before completion. "
+                            "Delegate additional focused research tasks for uncovered dimensions."
+                        )
+                    )
+                ]
+            }
+        )
     
     # Step 2: Process all tool calls together (both think_tool and ConductResearch)
     all_tool_messages = []
-    update_payload = {"supervisor_messages": []}
+    update_payload = {
+        "supervisor_messages": [],
+        "conduct_research_iterations": conduct_research_iterations,
+    }
     
     # Handle think_tool calls (strategic reflection)
     think_tool_calls = [
@@ -281,6 +334,33 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             name="think_tool",
             tool_call_id=tool_call["id"]
         ))
+
+    # Handle ResearchComplete calls (only allowed once minimum delegation is met)
+    research_complete_calls = [
+        tool_call
+        for tool_call in most_recent_message.tool_calls
+        if tool_call["name"] == "ResearchComplete"
+    ]
+
+    if research_complete_calls and can_complete:
+        return Command(
+            goto=END,
+            update={
+                "notes": get_notes_from_tool_calls(supervisor_messages),
+                "research_brief": state.get("research_brief", "")
+            }
+        )
+
+    for tool_call in research_complete_calls:
+        all_tool_messages.append(ToolMessage(
+            content=(
+                f"ResearchComplete rejected for now: minimum ConductResearch delegations not met "
+                f"({conduct_research_iterations}/{min_conduct_research_calls}). "
+                "Delegate additional focused research tasks before completing."
+            ),
+            name="ResearchComplete",
+            tool_call_id=tool_call["id"],
+        ))
     
     # Handle ConductResearch calls (research delegation)
     conduct_research_calls = [
@@ -290,22 +370,28 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     
     if conduct_research_calls:
         try:
-            # Limit concurrent research units to prevent resource exhaustion
-            allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
-            overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
+            # Limit concurrent research units and enforce remaining ConductResearch budget.
+            remaining_budget = max(0, max_conduct_research_calls - conduct_research_iterations)
+            allowed_count = min(
+                configurable.max_concurrent_research_units,
+                remaining_budget,
+            )
+            allowed_conduct_research_calls = conduct_research_calls[:allowed_count]
+            overflow_conduct_research_calls = conduct_research_calls[allowed_count:]
             
             # Execute research tasks in parallel
-            research_tasks = [
-                researcher_subgraph.ainvoke({
-                    "researcher_messages": [
-                        HumanMessage(content=tool_call["args"]["research_topic"])
-                    ],
-                    "research_topic": tool_call["args"]["research_topic"]
-                }, config) 
-                for tool_call in allowed_conduct_research_calls
-            ]
-            
-            tool_results = await asyncio.gather(*research_tasks)
+            tool_results = []
+            if allowed_conduct_research_calls:
+                research_tasks = [
+                    researcher_subgraph.ainvoke({
+                        "researcher_messages": [
+                            HumanMessage(content=tool_call["args"]["research_topic"])
+                        ],
+                        "research_topic": tool_call["args"]["research_topic"]
+                    }, config)
+                    for tool_call in allowed_conduct_research_calls
+                ]
+                tool_results = await asyncio.gather(*research_tasks)
             
             # Create tool messages with research results
             for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
@@ -318,7 +404,10 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             # Handle overflow research calls with error messages
             for overflow_call in overflow_conduct_research_calls:
                 all_tool_messages.append(ToolMessage(
-                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
+                    content=(
+                        "Error: Did not run this research because you exceeded the "
+                        "remaining ConductResearch budget or maximum concurrent research units."
+                    ),
                     name="ConductResearch",
                     tool_call_id=overflow_call["id"]
                 ))
@@ -331,6 +420,10 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             
             if raw_notes_concat:
                 update_payload["raw_notes"] = [raw_notes_concat]
+
+            update_payload["conduct_research_iterations"] = (
+                conduct_research_iterations + len(allowed_conduct_research_calls)
+            )
                 
         except Exception as e:
             # Handle research execution errors
@@ -403,7 +496,8 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     # Prepare system prompt with MCP context if available
     researcher_prompt = research_system_prompt.format(
         mcp_prompt=configurable.mcp_prompt or "", 
-        date=get_today_str()
+        date=get_today_str(),
+        max_react_tool_calls=configurable.max_react_tool_calls,
     )
     
     # Configure model with tools, retry logic, and settings
@@ -423,7 +517,6 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         goto="researcher_tools",
         update={
             "researcher_messages": [response],
-            "tool_call_iterations": state.get("tool_call_iterations", 0) + 1
         }
     )
 
@@ -493,7 +586,16 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     ]
     
     # Step 3: Check late exit conditions (after processing tools)
-    exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
+    search_tool_call_count = state.get("search_tool_call_count", 0)
+    budgeted_calls = [
+        tool_call
+        for tool_call in most_recent_message.tool_calls
+        if tool_call["name"] not in {"think_tool", "ResearchComplete"}
+    ]
+    next_search_tool_call_count = search_tool_call_count + len(budgeted_calls)
+    exceeded_iterations = (
+        next_search_tool_call_count >= configurable.max_react_tool_calls
+    )
     research_complete_called = any(
         tool_call["name"] == "ResearchComplete" 
         for tool_call in most_recent_message.tool_calls
@@ -503,13 +605,19 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         # End research and proceed to compression
         return Command(
             goto="compress_research",
-            update={"researcher_messages": tool_outputs}
+            update={
+                "researcher_messages": tool_outputs,
+                "search_tool_call_count": next_search_tool_call_count,
+            }
         )
     
     # Continue research loop with tool results
     return Command(
         goto="researcher",
-        update={"researcher_messages": tool_outputs}
+        update={
+            "researcher_messages": tool_outputs,
+            "search_tool_call_count": next_search_tool_call_count,
+        }
     )
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):

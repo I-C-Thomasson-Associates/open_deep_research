@@ -100,7 +100,7 @@ class Configuration(BaseModel):
                 "min": 1,
                 "max": 10,
                 "step": 1,
-                "description": "Maximum number of research iterations for the Research Supervisor. This is the number of times the Research Supervisor will reflect on the research and ask follow-up questions."
+                "description": "Maximum number of ConductResearch delegations by the Research Supervisor (think_tool reflections do not count against this limit)."
             }
         }
     )
@@ -113,7 +113,7 @@ class Configuration(BaseModel):
                 "min": 1,
                 "max": 30,
                 "step": 1,
-                "description": "Maximum number of tool calling iterations to make in a single researcher step."
+                "description": "Maximum number of search/tool calls by each researcher (think_tool reflections do not count against this limit)."
             }
         }
     )
