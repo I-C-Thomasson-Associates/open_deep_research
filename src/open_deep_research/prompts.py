@@ -223,19 +223,18 @@ compress_research_system_prompt = """You are a research assistant that has condu
 
 <Task>
 You need to clean up information gathered from tool calls and web searches in the existing messages.
-All relevant information should be repeated and rewritten verbatim, but in a cleaner format.
-The purpose of this step is just to remove any obviously irrelevant or duplicative information.
-For example, if three sources all say "X", you could say "These three sources all stated X".
-Only these fully comprehensive cleaned findings are going to be returned to the user, so it's crucial that you don't lose any information from the raw messages.
+Preserve all claim-relevant evidence, but remove irrelevant noise and low-signal repetition.
+The purpose of this step is to produce high-fidelity, auditable findings that keep concrete evidence while dropping weak filler.
+For example, if three credible sources all say "X", you can preserve that once and list supporting citations.
 </Task>
 
 <Guidelines>
-1. Your output findings should be fully comprehensive and include ALL of the information and sources that the researcher has gathered from tool calls and web searches. It is expected that you repeat key information verbatim.
-2. This report can be as long as necessary to return ALL of the information that the researcher has gathered.
+1. Your output findings should be comprehensive and preserve all claim-relevant evidence from the research messages.
+2. Keep findings detailed, but remove irrelevant, duplicative, or weakly supported content.
 3. In your report, you should return inline citations for each source that the researcher found.
-4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
-5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
-6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
+4. Include a "Sources" section at the end of the report that lists only sources used to support concrete claims.
+5. Prefer primary/official sources when available; use secondary sources only when they add unique evidence.
+6. Do not preserve noisy links just because they appeared in tool output.
 7. Extract concrete, structured evidence records from the findings.
 </Guidelines>
 
@@ -260,6 +259,7 @@ The report should be structured like this:
   - dimension
 - Use empty strings when date/metric are unavailable.
 - Prefer primary sources for source_url when available.
+- Do not include low-trust/aggregator links in source_url when a stronger source exists for the same claim.
 </Evidence Ledger JSON Requirements>
 
 <Citation Rules>
@@ -271,7 +271,7 @@ The report should be structured like this:
   [2] Source Title: URL
 </Citation Rules>
 
-Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
+Critical Reminder: Preserve evidence quality and claim traceability. Keep concrete evidence, avoid noisy source dumping.
 """
 
 compress_research_simple_human_message = """All above messages are about research conducted by an AI Researcher. Please clean up these findings.
@@ -321,6 +321,8 @@ Please create a detailed answer to the overall research brief that:
 4. Provides analytical, thorough coverage. Include interpretation and cross-section connections, not only descriptive summaries.
 5. Includes a "Sources" section at the end with all referenced links
 6. Uses the Evidence Ledger to ensure concrete claims are represented, especially for failures/incidents, launches, and quantitative evidence
+7. Every major concrete claim (named launch/failure/date/metric) should be traceable to at least one ledger item or cited source.
+8. Prioritize primary/official sources; if only weaker sources are available, explicitly mark the claim as lower-confidence.
 
 You can structure your report in a number of different ways. Here are some examples:
 
@@ -374,6 +376,7 @@ Format the report in clear markdown with proper structure and include source ref
   [1] Source Title: URL
   [2] Source Title: URL
 - Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+- Keep citation quality high: do not cite low-trust/aggregator links for core claims when primary sources are available.
 </Citation Rules>
 """
 

@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from typing import Literal
+from urllib.parse import urlparse, urlunparse
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
@@ -164,6 +165,46 @@ _DIMENSION_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
+_LOW_TRUST_DOMAINS = {
+    "facebook.com",
+    "reddit.com",
+    "x.com",
+    "twitter.com",
+    "youtube.com",
+    "tiktok.com",
+    "medium.com",
+    "substack.com",
+    "blogspot.com",
+    "wordpress.com",
+    "quora.com",
+}
+
+_PRIMARY_SOURCE_HINTS = {
+    "arxiv.org",
+    "openreview.net",
+    "aclanthology.org",
+    "nature.com",
+    "science.org",
+    "springer.com",
+    "cell.com",
+    "nejm.org",
+    "who.int",
+    "nih.gov",
+    "nist.gov",
+    "sec.gov",
+    "europa.eu",
+    "openai.com",
+    "anthropic.com",
+    "google.com",
+    "microsoft.com",
+    "meta.com",
+    "deepmind.com",
+    "github.com",
+    "ietf.org",
+    "iso.org",
+}
+
+
 def _normalize_dimension(dimension: str) -> str:
     return re.sub(r"\s+", " ", (dimension or "").strip().lower())
 
@@ -279,12 +320,207 @@ def _strip_evidence_ledger_section(text: str) -> str:
     return cleaned.strip()
 
 
-def _format_evidence_ledger_for_prompt(evidence_ledger: list[dict], max_items: int = 120) -> str:
+def _normalize_url(url: str) -> str:
+    raw = str(url or "").strip().rstrip(".,;:)")
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path or ""
+    normalized = parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        query="",
+        fragment="",
+        path=path.rstrip("/") if path and path != "/" else path,
+    )
+    return urlunparse(normalized)
+
+
+def _domain_for_url(url: str) -> str:
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _is_primary_domain(domain: str) -> bool:
+    if not domain:
+        return False
+    if domain.endswith(".gov") or domain.endswith(".edu"):
+        return True
+    return any(domain == d or domain.endswith(f".{d}") for d in _PRIMARY_SOURCE_HINTS)
+
+
+def _is_low_trust_domain(domain: str) -> bool:
+    if not domain:
+        return False
+    return any(domain == d or domain.endswith(f".{d}") for d in _LOW_TRUST_DOMAINS)
+
+
+def _curate_evidence_for_prompt(evidence_ledger: list[dict], max_items: int) -> list[dict]:
     if not evidence_ledger:
+        return []
+
+    deduped: dict[tuple[str, str], dict] = {}
+    for item in evidence_ledger:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim", "")).strip()
+        source_url = _normalize_url(str(item.get("source_url", "")))
+        if not claim or not source_url:
+            continue
+        key = (claim.lower(), source_url)
+        if key in deduped:
+            continue
+        entry = dict(item)
+        entry["source_url"] = source_url
+        deduped[key] = entry
+
+    scored: list[tuple[int, dict]] = []
+    for item in deduped.values():
+        source_url = str(item.get("source_url", "")).strip()
+        domain = _domain_for_url(source_url)
+        score = 0
+        if _is_primary_domain(domain):
+            score += 4
+        if _is_low_trust_domain(domain):
+            score -= 4
+        if str(item.get("metric", "")).strip():
+            score += 1
+        if str(item.get("date", "")).strip():
+            score += 1
+        if str(item.get("entity", "")).strip():
+            score += 1
+        scored.append((score, item))
+
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            bool(str(pair[1].get("metric", "")).strip()),
+            bool(str(pair[1].get("date", "")).strip()),
+        ),
+        reverse=True,
+    )
+
+    return [item for _, item in scored[:max_items]]
+
+
+def _evaluate_evidence_quality(
+    evidence_ledger: list[dict],
+    required_dimensions: list[str],
+) -> dict[str, object]:
+    curated = _curate_evidence_for_prompt(evidence_ledger, max_items=200)
+    if not curated:
+        return {
+            "pass": False,
+            "reason": "no structured evidence was captured",
+            "primary_ratio": 0.0,
+            "unique_source_count": 0,
+            "covered_dimension_count": 0,
+            "required_dimension_floor": max(1, len(required_dimensions) // 2),
+        }
+
+    unique_sources: set[str] = set()
+    primary_count = 0
+    low_trust_count = 0
+    for item in curated:
+        source_url = _normalize_url(str(item.get("source_url", "")))
+        if not source_url:
+            continue
+        unique_sources.add(source_url)
+        domain = _domain_for_url(source_url)
+        if _is_primary_domain(domain):
+            primary_count += 1
+        if _is_low_trust_domain(domain):
+            low_trust_count += 1
+
+    normalized_required = {
+        _normalize_dimension(dim)
+        for dim in required_dimensions
+        if isinstance(dim, str) and dim.strip()
+    }
+    coverage_text = "\n".join(
+        " ".join(
+            [
+                str(item.get("dimension", "")).strip(),
+                str(item.get("claim", "")).strip(),
+            ]
+        )
+        for item in curated
+        if isinstance(item, dict)
+    )
+    covered_required = {
+        _normalize_dimension(dim)
+        for dim in _extract_covered_dimensions(required_dimensions, coverage_text)
+    }
+
+    unique_source_count = len(unique_sources)
+    primary_ratio = (
+        primary_count / len(curated)
+        if curated
+        else 0.0
+    )
+    low_trust_ratio = (
+        low_trust_count / len(curated)
+        if curated
+        else 0.0
+    )
+
+    min_sources_floor = 8 if len(normalized_required) >= 4 else 6
+    has_generic_dimension = "overall research brief coverage" in normalized_required
+    required_dimension_floor = 0 if has_generic_dimension else max(1, len(normalized_required) // 2)
+
+    quality_pass = (
+        unique_source_count >= min_sources_floor
+        and primary_ratio >= 0.4
+        and low_trust_ratio <= 0.35
+        and len(covered_required) >= required_dimension_floor
+    )
+
+    failure_reasons: list[str] = []
+    if unique_source_count < min_sources_floor:
+        failure_reasons.append(
+            f"need more distinct sources ({unique_source_count}/{min_sources_floor})"
+        )
+    if primary_ratio < 0.4:
+        failure_reasons.append(
+            f"primary-source ratio too low ({primary_ratio:.2f}/0.40)"
+        )
+    if low_trust_ratio > 0.35:
+        failure_reasons.append(
+            f"too many low-trust citations ({low_trust_ratio:.2f}>0.35)"
+        )
+    if len(covered_required) < required_dimension_floor:
+        failure_reasons.append(
+            "evidence does not cover enough required dimensions"
+        )
+
+    return {
+        "pass": quality_pass,
+        "reason": "; ".join(failure_reasons) if failure_reasons else "ok",
+        "primary_ratio": round(primary_ratio, 3),
+        "low_trust_ratio": round(low_trust_ratio, 3),
+        "unique_source_count": unique_source_count,
+        "covered_dimension_count": len(covered_required),
+        "required_dimension_floor": required_dimension_floor,
+    }
+
+
+def _format_evidence_ledger_for_prompt(evidence_ledger: list[dict], max_items: int = 120) -> str:
+    curated = _curate_evidence_for_prompt(evidence_ledger, max_items=max_items)
+    if not curated:
         return "No structured evidence ledger was provided."
 
     rows = []
-    for item in evidence_ledger[:max_items]:
+    for item in curated:
         claim = str(item.get("claim", "")).strip()
         entity = str(item.get("entity", "")).strip()
         date = str(item.get("date", "")).strip()
@@ -537,6 +773,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     conduct_research_iterations = state.get("conduct_research_iterations", 0)
     required_dimensions = state.get("required_dimensions", [])
     covered_dimensions = state.get("covered_dimensions", [])
+    evidence_ledger = state.get("evidence_ledger", [])
     most_recent_message = supervisor_messages[-1]
     max_conduct_research_calls = max(1, int(configurable.max_researcher_iterations))
     min_conduct_research_calls = min(
@@ -578,6 +815,22 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         conduct_research_iterations >= min_conduct_research_calls
         and len(uncovered_dimensions) == 0
     )
+    evidence_quality = _evaluate_evidence_quality(evidence_ledger, required_dimensions)
+    quality_gate_pass = bool(evidence_quality.get("pass"))
+
+    completion_reasons: list[str] = []
+    if conduct_research_iterations < min_conduct_research_calls:
+        completion_reasons.append(
+            f"need more ConductResearch delegations ({conduct_research_iterations}/{min_conduct_research_calls})"
+        )
+    if uncovered_dimensions:
+        completion_reasons.append(
+            f"uncovered dimensions: {', '.join(uncovered_dimensions)}"
+        )
+    if not quality_gate_pass:
+        completion_reasons.append(
+            f"evidence quality gate: {evidence_quality.get('reason', 'insufficient evidence quality')}"
+        )
 
     # Exit only when ceilings are reached or completion criteria are satisfied.
     if exceeded_allowed_iterations or exceeded_loop_guard:
@@ -588,12 +841,12 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 "research_brief": state.get("research_brief", ""),
                 "required_dimensions": required_dimensions,
                 "covered_dimensions": covered_dimensions,
-                "evidence_ledger": state.get("evidence_ledger", []),
+                "evidence_ledger": evidence_ledger,
             }
         )
 
     if no_tool_calls:
-        if can_complete:
+        if can_complete and quality_gate_pass:
             return Command(
                 goto=END,
                 update={
@@ -601,7 +854,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                     "research_brief": state.get("research_brief", ""),
                     "required_dimensions": required_dimensions,
                     "covered_dimensions": covered_dimensions,
-                    "evidence_ledger": state.get("evidence_ledger", []),
+                    "evidence_ledger": evidence_ledger,
                 }
             )
         return Command(
@@ -610,17 +863,16 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 "supervisor_messages": [
                     HumanMessage(
                         content=(
-                            f"Continue research. You have only delegated ConductResearch "
-                            f"{conduct_research_iterations} time(s), but this run requires at least "
-                            f"{min_conduct_research_calls} ConductResearch delegations before completion. "
-                            f"Uncovered dimensions: {', '.join(uncovered_dimensions) or 'none'}. "
-                            "Delegate additional focused research tasks for uncovered dimensions."
+                            "Continue research with stricter source quality targets. "
+                            f"Current blockers: {'; '.join(completion_reasons) or 'none'}. "
+                            "Delegate focused tasks to gather primary/official sources, replace low-trust citations, "
+                            "and fill uncovered dimensions."
                         )
                     )
                 ],
                 "covered_dimensions": covered_dimensions,
                 "required_dimensions": required_dimensions,
-                "evidence_ledger": state.get("evidence_ledger", []),
+                "evidence_ledger": evidence_ledger,
             }
         )
     
@@ -631,7 +883,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         "conduct_research_iterations": conduct_research_iterations,
         "covered_dimensions": covered_dimensions,
         "required_dimensions": required_dimensions,
-        "evidence_ledger": state.get("evidence_ledger", []),
+        "evidence_ledger": evidence_ledger,
     }
     
     # Handle think_tool calls (strategic reflection)
@@ -655,7 +907,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         if tool_call["name"] == "ResearchComplete"
     ]
 
-    if research_complete_calls and can_complete:
+    if research_complete_calls and can_complete and quality_gate_pass:
         return Command(
             goto=END,
             update={
@@ -663,16 +915,15 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 "research_brief": state.get("research_brief", ""),
                 "required_dimensions": required_dimensions,
                 "covered_dimensions": covered_dimensions,
-                "evidence_ledger": state.get("evidence_ledger", []),
+                "evidence_ledger": evidence_ledger,
             }
         )
 
     for tool_call in research_complete_calls:
         all_tool_messages.append(ToolMessage(
             content=(
-                f"ResearchComplete rejected for now. ConductResearch delegations: "
-                f"{conduct_research_iterations}/{min_conduct_research_calls}. "
-                f"Uncovered dimensions: {', '.join(uncovered_dimensions) or 'none'}. "
+                "ResearchComplete rejected for now. "
+                f"Blockers: {'; '.join(completion_reasons) or 'none'}. "
                 "Delegate additional focused research tasks before completing."
             ),
             name="ResearchComplete",
