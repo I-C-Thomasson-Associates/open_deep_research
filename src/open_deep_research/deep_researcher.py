@@ -1,6 +1,8 @@
 """Main LangGraph implementation for the Deep Research agent."""
 
 import asyncio
+import json
+import re
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -23,6 +25,7 @@ from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
     compress_research_system_prompt,
+    extract_dimensions_prompt,
     final_report_generation_prompt,
     lead_researcher_prompt,
     research_system_prompt,
@@ -33,7 +36,9 @@ from open_deep_research.state import (
     AgentState,
     ClarifyWithUser,
     ConductResearch,
+    EvidenceItem,
     ResearchComplete,
+    ResearchDimensions,
     ResearcherOutputState,
     ResearcherState,
     ResearchQuestion,
@@ -71,6 +76,235 @@ def _min_conduct_research_calls(max_researcher_iterations: int) -> int:
     if max_researcher_iterations <= 3:
         return 2
     return 3
+
+
+_DIMENSION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "timeline and milestones": (
+        "timeline",
+        "milestone",
+        "chronolog",
+        "history",
+        "since",
+        "year",
+    ),
+    "technical mechanisms and architectures": (
+        "architecture",
+        "mechanism",
+        "attention",
+        "transformer",
+        "model",
+        "scaling",
+        "rlhf",
+        "moe",
+    ),
+    "products launched and adoption": (
+        "product",
+        "launch",
+        "released",
+        "assistant",
+        "copilot",
+        "adoption",
+        "users",
+    ),
+    "failed/discontinued products and incidents": (
+        "failed",
+        "failure",
+        "discontinued",
+        "shutdown",
+        "sunset",
+        "incident",
+        "lawsuit",
+        "flop",
+    ),
+    "new technologies and methods": (
+        "new technolog",
+        "method",
+        "innovation",
+        "rag",
+        "agent",
+        "multimodal",
+        "flashattention",
+        "lora",
+        "quantization",
+        "long context",
+        "diffusion",
+    ),
+    "economics and market impact": (
+        "cost",
+        "revenue",
+        "market",
+        "investment",
+        "productivity",
+        "economic",
+        "spending",
+    ),
+    "regulation and governance": (
+        "regulation",
+        "governance",
+        "ai act",
+        "executive order",
+        "nist",
+        "policy",
+        "compliance",
+        "law",
+    ),
+    "deployment and inference engineering": (
+        "deployment",
+        "inference",
+        "serving",
+        "latency",
+        "throughput",
+        "vllm",
+        "tensorrt",
+        "kv cache",
+        "fine-tuning",
+        "peft",
+        "infrastructure",
+    ),
+}
+
+
+def _normalize_dimension(dimension: str) -> str:
+    return re.sub(r"\s+", " ", (dimension or "").strip().lower())
+
+
+def _format_required_dimensions(required_dimensions: list[str]) -> str:
+    if not required_dimensions:
+        return "- overall research brief coverage"
+    lines = [f"- {dim}" for dim in required_dimensions]
+    return "\n".join(lines)
+
+
+def _extract_covered_dimensions(required_dimensions: list[str], text: str) -> list[str]:
+    normalized_text = _normalize_dimension(text)
+    covered: list[str] = []
+    for raw_dim in required_dimensions:
+        dim = _normalize_dimension(raw_dim)
+        if not dim:
+            continue
+        if dim in normalized_text:
+            covered.append(raw_dim)
+            continue
+        if dim.startswith("other:"):
+            other_label = dim.split("other:", 1)[1].strip()
+            if other_label and other_label in normalized_text:
+                covered.append(raw_dim)
+            continue
+
+        keywords = _DIMENSION_KEYWORDS.get(dim, ())
+        if any(keyword in normalized_text for keyword in keywords):
+            covered.append(raw_dim)
+    return covered
+
+
+def _merge_dimensions(existing: list[str], newly_covered: list[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for dim in existing + newly_covered:
+        if not dim:
+            continue
+        key = _normalize_dimension(dim)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dim)
+    return merged
+
+
+def _extract_evidence_ledger(text: str, max_items: int = 30) -> list[dict]:
+    if not text:
+        return []
+
+    candidates: list[str] = []
+
+    fenced_blocks = re.findall(r"```json\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(fenced_blocks)
+
+    marker_match = re.search(
+        r"###\s*Evidence Ledger \(JSON\)\s*(.*)$",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if marker_match:
+        candidates.append(marker_match.group(1).strip())
+
+    parsed_items: list[dict] = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+
+        if isinstance(data, dict):
+            data = data.get("evidence_ledger")
+        if not isinstance(data, list):
+            continue
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed = EvidenceItem(**{
+                    "claim": str(item.get("claim", "")).strip(),
+                    "entity": str(item.get("entity", "")).strip(),
+                    "date": str(item.get("date", "")).strip(),
+                    "metric": str(item.get("metric", "")).strip(),
+                    "source_url": str(item.get("source_url", "")).strip(),
+                    "dimension": str(item.get("dimension", "")).strip(),
+                })
+            except Exception:
+                continue
+
+            if not parsed.claim or not parsed.source_url:
+                continue
+            parsed_items.append(parsed.model_dump())
+            if len(parsed_items) >= max_items:
+                return parsed_items
+
+    return parsed_items
+
+
+def _strip_evidence_ledger_section(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r"\n*###\s*Evidence Ledger \(JSON\).*?$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def _format_evidence_ledger_for_prompt(evidence_ledger: list[dict], max_items: int = 120) -> str:
+    if not evidence_ledger:
+        return "No structured evidence ledger was provided."
+
+    rows = []
+    for item in evidence_ledger[:max_items]:
+        claim = str(item.get("claim", "")).strip()
+        entity = str(item.get("entity", "")).strip()
+        date = str(item.get("date", "")).strip()
+        metric = str(item.get("metric", "")).strip()
+        source_url = str(item.get("source_url", "")).strip()
+        dimension = str(item.get("dimension", "")).strip()
+        rows.append(
+            " | ".join([
+                claim or "",
+                entity or "",
+                date or "",
+                metric or "",
+                source_url or "",
+                dimension or "",
+            ])
+        )
+
+    header = "claim | entity | date | metric | source_url | dimension"
+    divider = "--- | --- | --- | --- | --- | ---"
+    return "\n".join([header, divider, *rows])
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
@@ -170,7 +404,42 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
     
-    # Step 3: Initialize supervisor with research brief and instructions
+    # Step 3: Extract required dimensions from the research brief
+    dimensions_model_config = {
+        "model": configurable.summarization_model,
+        "max_tokens": configurable.summarization_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.summarization_model, config),
+        "temperature": 0,
+        "tags": ["langsmith:nostream"],
+    }
+
+    required_dimensions: list[str] = []
+    try:
+        dimensions_model = (
+            configurable_model
+            .with_structured_output(ResearchDimensions)
+            .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+            .with_config(dimensions_model_config)
+        )
+        dimensions_prompt = extract_dimensions_prompt.format(
+            research_brief=response.research_brief,
+            date=get_today_str(),
+        )
+        dimensions_response = await dimensions_model.ainvoke(
+            [HumanMessage(content=dimensions_prompt)]
+        )
+        required_dimensions = [
+            re.sub(r"\s+", " ", dim).strip()
+            for dim in dimensions_response.dimensions
+            if isinstance(dim, str) and dim.strip()
+        ]
+    except Exception:
+        required_dimensions = []
+
+    if not required_dimensions:
+        required_dimensions = ["overall research brief coverage"]
+
+    # Step 4: Initialize supervisor with research brief and instructions
     supervisor_system_prompt = lead_researcher_prompt.format(
         date=get_today_str(),
         max_concurrent_research_units=configurable.max_concurrent_research_units,
@@ -178,12 +447,15 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         min_conduct_research_calls=_min_conduct_research_calls(
             configurable.max_researcher_iterations
         ),
+        required_dimensions=_format_required_dimensions(required_dimensions),
     )
     
     return Command(
         goto="research_supervisor", 
         update={
             "research_brief": response.research_brief,
+            "required_dimensions": required_dimensions,
+            "covered_dimensions": [],
             "supervisor_messages": {
                 "type": "override",
                 "value": [
@@ -263,6 +535,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     supervisor_messages = state.get("supervisor_messages", [])
     research_iterations = state.get("research_iterations", 0)
     conduct_research_iterations = state.get("conduct_research_iterations", 0)
+    required_dimensions = state.get("required_dimensions", [])
+    covered_dimensions = state.get("covered_dimensions", [])
     most_recent_message = supervisor_messages[-1]
     max_conduct_research_calls = max(1, int(configurable.max_researcher_iterations))
     min_conduct_research_calls = min(
@@ -277,7 +551,33 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     exceeded_loop_guard = research_iterations > max_conduct_research_calls * 4
     no_tool_calls = not most_recent_message.tool_calls
 
-    can_complete = conduct_research_iterations >= min_conduct_research_calls
+    searchable_parts = []
+    searchable_parts.extend(
+        str(msg.content)
+        for msg in supervisor_messages
+        if getattr(msg, "content", None)
+    )
+    searchable_parts.extend(
+        str(tool_call.get("args", {}).get("research_topic", ""))
+        for tool_call in (most_recent_message.tool_calls or [])
+        if isinstance(tool_call, dict)
+    )
+    newly_covered = _extract_covered_dimensions(
+        required_dimensions,
+        "\n".join(searchable_parts),
+    )
+    covered_dimensions = _merge_dimensions(covered_dimensions, newly_covered)
+    uncovered_dimensions = [
+        dim
+        for dim in required_dimensions
+        if _normalize_dimension(dim)
+        not in {_normalize_dimension(c) for c in covered_dimensions}
+    ]
+
+    can_complete = (
+        conduct_research_iterations >= min_conduct_research_calls
+        and len(uncovered_dimensions) == 0
+    )
 
     # Exit only when ceilings are reached or completion criteria are satisfied.
     if exceeded_allowed_iterations or exceeded_loop_guard:
@@ -285,7 +585,10 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             goto=END,
             update={
                 "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", "")
+                "research_brief": state.get("research_brief", ""),
+                "required_dimensions": required_dimensions,
+                "covered_dimensions": covered_dimensions,
+                "evidence_ledger": state.get("evidence_ledger", []),
             }
         )
 
@@ -295,7 +598,10 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 goto=END,
                 update={
                     "notes": get_notes_from_tool_calls(supervisor_messages),
-                    "research_brief": state.get("research_brief", "")
+                    "research_brief": state.get("research_brief", ""),
+                    "required_dimensions": required_dimensions,
+                    "covered_dimensions": covered_dimensions,
+                    "evidence_ledger": state.get("evidence_ledger", []),
                 }
             )
         return Command(
@@ -307,10 +613,14 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                             f"Continue research. You have only delegated ConductResearch "
                             f"{conduct_research_iterations} time(s), but this run requires at least "
                             f"{min_conduct_research_calls} ConductResearch delegations before completion. "
+                            f"Uncovered dimensions: {', '.join(uncovered_dimensions) or 'none'}. "
                             "Delegate additional focused research tasks for uncovered dimensions."
                         )
                     )
-                ]
+                ],
+                "covered_dimensions": covered_dimensions,
+                "required_dimensions": required_dimensions,
+                "evidence_ledger": state.get("evidence_ledger", []),
             }
         )
     
@@ -319,6 +629,9 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     update_payload = {
         "supervisor_messages": [],
         "conduct_research_iterations": conduct_research_iterations,
+        "covered_dimensions": covered_dimensions,
+        "required_dimensions": required_dimensions,
+        "evidence_ledger": state.get("evidence_ledger", []),
     }
     
     # Handle think_tool calls (strategic reflection)
@@ -347,15 +660,19 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             goto=END,
             update={
                 "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", "")
+                "research_brief": state.get("research_brief", ""),
+                "required_dimensions": required_dimensions,
+                "covered_dimensions": covered_dimensions,
+                "evidence_ledger": state.get("evidence_ledger", []),
             }
         )
 
     for tool_call in research_complete_calls:
         all_tool_messages.append(ToolMessage(
             content=(
-                f"ResearchComplete rejected for now: minimum ConductResearch delegations not met "
-                f"({conduct_research_iterations}/{min_conduct_research_calls}). "
+                f"ResearchComplete rejected for now. ConductResearch delegations: "
+                f"{conduct_research_iterations}/{min_conduct_research_calls}. "
+                f"Uncovered dimensions: {', '.join(uncovered_dimensions) or 'none'}. "
                 "Delegate additional focused research tasks before completing."
             ),
             name="ResearchComplete",
@@ -421,6 +738,17 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             if raw_notes_concat:
                 update_payload["raw_notes"] = [raw_notes_concat]
 
+            aggregated_evidence: list[dict] = list(update_payload.get("evidence_ledger", []))
+            for observation in tool_results:
+                observation_evidence = observation.get("evidence_ledger", [])
+                if isinstance(observation_evidence, list):
+                    aggregated_evidence.extend(
+                        item
+                        for item in observation_evidence
+                        if isinstance(item, dict)
+                    )
+            update_payload["evidence_ledger"] = aggregated_evidence
+
             update_payload["conduct_research_iterations"] = (
                 conduct_research_iterations + len(allowed_conduct_research_calls)
             )
@@ -433,7 +761,10 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                     goto=END,
                     update={
                         "notes": get_notes_from_tool_calls(supervisor_messages),
-                        "research_brief": state.get("research_brief", "")
+                        "research_brief": state.get("research_brief", ""),
+                        "required_dimensions": required_dimensions,
+                        "covered_dimensions": covered_dimensions,
+                        "evidence_ledger": update_payload.get("evidence_ledger", []),
                     }
                 )
     
@@ -662,6 +993,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             
             # Execute compression
             response = await synthesizer_model.ainvoke(messages)
+            response_content = str(response.content)
+
+            evidence_ledger = _extract_evidence_ledger(response_content, max_items=30)
+            cleaned_compressed_research = _strip_evidence_ledger_section(response_content)
             
             # Extract raw notes from all tool and AI messages
             raw_notes_content = "\n".join([
@@ -671,8 +1006,9 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             
             # Return successful compression result
             return {
-                "compressed_research": str(response.content),
-                "raw_notes": [raw_notes_content]
+                "compressed_research": cleaned_compressed_research,
+                "raw_notes": [raw_notes_content],
+                "evidence_ledger": evidence_ledger,
             }
             
         except Exception as e:
@@ -694,7 +1030,8 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     
     return {
         "compressed_research": "Error synthesizing research report: Maximum retries exceeded",
-        "raw_notes": [raw_notes_content]
+        "raw_notes": [raw_notes_content],
+        "evidence_ledger": [],
     }
 
 # Researcher Subgraph Construction
@@ -734,6 +1071,9 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
     cleared_state = {"notes": {"type": "override", "value": []}}
     findings = "\n".join(notes)
+    evidence_ledger_text = _format_evidence_ledger_for_prompt(
+        state.get("evidence_ledger", []),
+    )
     
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
@@ -757,6 +1097,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 research_brief=state.get("research_brief", ""),
                 messages=get_buffer_string(state.get("messages", [])),
                 findings=findings,
+                evidence_ledger=evidence_ledger_text,
                 date=get_today_str()
             )
             

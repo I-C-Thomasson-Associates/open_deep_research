@@ -76,6 +76,32 @@ Guidelines:
 - If the query is in a specific language, prioritize sources published in that language.
 """
 
+
+extract_dimensions_prompt = """You will be given a research brief. Extract the required research dimensions that must be covered before research can be considered complete.
+
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+Today's date is {date}.
+
+Return dimensions using clear canonical labels. Prefer this taxonomy when relevant:
+- timeline and milestones
+- technical mechanisms and architectures
+- products launched and adoption
+- failed/discontinued products and incidents
+- new technologies and methods
+- economics and market impact
+- regulation and governance
+- deployment and inference engineering
+
+Rules:
+1. Include only dimensions explicitly requested by the user or necessary to satisfy the brief.
+2. Use concise, reusable labels.
+3. Return at least one dimension.
+4. If a required dimension does not fit taxonomy, add "other: <label>".
+"""
+
 lead_researcher_prompt = """You are a research supervisor. Your job is to conduct research by calling the "ConductResearch" tool. For context, today's date is {date}.
 
 <Task>
@@ -91,6 +117,11 @@ You have access to three main tools:
 
 **CRITICAL: Use think_tool before calling ConductResearch to plan your approach, and after each ConductResearch to assess progress. Do not call think_tool with any other tools in parallel.**
 </Available Tools>
+
+<Required Dimensions>
+You must cover all of these dimensions before calling ResearchComplete:
+{required_dimensions}
+</Required Dimensions>
 
 <Instructions>
 Think like a research manager who values thoroughness. Follow these steps:
@@ -205,6 +236,7 @@ Only these fully comprehensive cleaned findings are going to be returned to the 
 4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
 5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
 6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
+7. Extract concrete, structured evidence records from the findings.
 </Guidelines>
 
 <Output Format>
@@ -212,7 +244,23 @@ The report should be structured like this:
 **List of Queries and Tool Calls Made**
 **Fully Comprehensive Findings**
 **List of All Relevant Sources (with citations in the report)**
+**Evidence Ledger (JSON Array)**
 </Output Format>
+
+<Evidence Ledger JSON Requirements>
+- After your prose report, include a markdown heading exactly: `### Evidence Ledger (JSON)`.
+- Under that heading, output a JSON array inside a ```json fenced block.
+- Include up to 30 items.
+- Every item must include:
+  - claim
+  - entity
+  - date
+  - metric
+  - source_url
+  - dimension
+- Use empty strings when date/metric are unavailable.
+- Prefer primary sources for source_url when available.
+</Evidence Ledger JSON Requirements>
 
 <Citation Rules>
 - Assign each unique URL a single citation number in your text
@@ -250,6 +298,11 @@ Here are the findings from the research that you conducted:
 {findings}
 </Findings>
 
+Here is the structured evidence ledger extracted from sub-researchers:
+<EvidenceLedger>
+{evidence_ledger}
+</EvidenceLedger>
+
 <Analytical Quality Requirements>
 The report must meet these quality standards:
 
@@ -267,6 +320,7 @@ Please create a detailed answer to the overall research brief that:
 3. References relevant sources using [Title](URL) format
 4. Provides analytical, thorough coverage. Include interpretation and cross-section connections, not only descriptive summaries.
 5. Includes a "Sources" section at the end with all referenced links
+6. Uses the Evidence Ledger to ensure concrete claims are represented, especially for failures/incidents, launches, and quantitative evidence
 
 You can structure your report in a number of different ways. Here are some examples:
 
