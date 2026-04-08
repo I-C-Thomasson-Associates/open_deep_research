@@ -303,6 +303,11 @@ Here is the structured evidence ledger extracted from sub-researchers:
 {evidence_ledger}
 </EvidenceLedger>
 
+Potentially forward-looking or forecast-style claims detected in evidence:
+<ForwardLookingClaims>
+{forward_claims}
+</ForwardLookingClaims>
+
 <Analytical Quality Requirements>
 The report must meet these quality standards:
 
@@ -314,12 +319,20 @@ The report must meet these quality standards:
 6. **Use structure for comparison.** Use markdown tables when comparing three or more items across shared dimensions.
 </Analytical Quality Requirements>
 
+<Forward-Looking Confidence Rules>
+- If a claim is forward-looking, forecast-based, or dated beyond today's date, label it explicitly as a forecast/projection.
+- Do NOT state forward-looking claims as established facts.
+- For forward-looking claims, add confidence tags such as (confidence: high/medium/low) based on source strength.
+- Use lower confidence when evidence is secondary, low-trust, or conflicting.
+- If a forecast claim is weakly supported, keep it brief and clearly caveated.
+</Forward-Looking Confidence Rules>
+
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
 2. Includes specific facts, figures, dates, and named examples from the research
-3. References relevant sources using [Title](URL) format
+3. References relevant sources with precise inline citations that map to the Sources list
 4. Provides analytical, thorough coverage. Include interpretation and cross-section connections, not only descriptive summaries.
-5. Includes a "Sources" section at the end with all referenced links
+5. Includes a "Sources" section at the end with all referenced links, using exact URLs
 6. Uses the Evidence Ledger to ensure concrete claims are represented, especially for failures/incidents, launches, and quantitative evidence
 7. Every major concrete claim (named launch/failure/date/metric) should be traceable to at least one ledger item or cited source.
 8. Prioritize primary/official sources; if only weaker sources are available, explicitly mark the claim as lower-confidence.
@@ -373,10 +386,11 @@ Format the report in clear markdown with proper structure and include source ref
 - IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
 - Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
 - Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
+  [1] https://example.com/first-source
+  [2] https://example.com/second-source
 - Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
 - Keep citation quality high: do not cite low-trust/aggregator links for core claims when primary sources are available.
+- Do not pair a source title/domain label with a different URL. If unsure, output only the exact URL.
 </Citation Rules>
 """
 

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
@@ -203,6 +204,11 @@ _PRIMARY_SOURCE_HINTS = {
     "ietf.org",
     "iso.org",
 }
+
+_FORWARD_LANGUAGE_PATTERN = re.compile(
+    r"\b(will|expected|projected|forecast|forecasted|anticipat(?:e|ed)|likely|roadmap|plan(?:s|ned)?)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _normalize_dimension(dimension: str) -> str:
@@ -477,12 +483,23 @@ def _evaluate_evidence_quality(
     min_sources_floor = 8 if len(normalized_required) >= 4 else 6
     has_generic_dimension = "overall research brief coverage" in normalized_required
     required_dimension_floor = 0 if has_generic_dimension else max(1, len(normalized_required) // 2)
+    forward_claims = _extract_forward_claim_watchlist(curated, max_items=60)
+    low_conf_forward_count = sum(
+        1
+        for item in forward_claims
+        if str(item.get("confidence_hint", "")).lower() == "low"
+    )
+    forward_quality_ok = (
+        not forward_claims
+        or low_conf_forward_count <= max(2, len(forward_claims) // 2)
+    )
 
     quality_pass = (
         unique_source_count >= min_sources_floor
         and primary_ratio >= 0.4
         and low_trust_ratio <= 0.35
         and len(covered_required) >= required_dimension_floor
+        and forward_quality_ok
     )
 
     failure_reasons: list[str] = []
@@ -502,6 +519,10 @@ def _evaluate_evidence_quality(
         failure_reasons.append(
             "evidence does not cover enough required dimensions"
         )
+    if not forward_quality_ok:
+        failure_reasons.append(
+            "too many forward-looking claims have low-confidence evidence"
+        )
 
     return {
         "pass": quality_pass,
@@ -511,7 +532,94 @@ def _evaluate_evidence_quality(
         "unique_source_count": unique_source_count,
         "covered_dimension_count": len(covered_required),
         "required_dimension_floor": required_dimension_floor,
+        "forward_claim_count": len(forward_claims),
+        "low_conf_forward_count": low_conf_forward_count,
     }
+
+
+def _extract_forward_claim_watchlist(
+    evidence_ledger: list[dict],
+    max_items: int = 40,
+) -> list[dict[str, str]]:
+    current_year = datetime.now(timezone.utc).year
+    watchlist: list[dict[str, str]] = []
+
+    for item in evidence_ledger:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim", "")).strip()
+        if not claim:
+            continue
+        date_text = str(item.get("date", "")).strip()
+        source_url = _normalize_url(str(item.get("source_url", "")))
+        domain = _domain_for_url(source_url)
+        is_primary = _is_primary_domain(domain)
+        is_low_trust = _is_low_trust_domain(domain)
+
+        years = [
+            int(year)
+            for year in re.findall(r"\b(20\d{2})\b", f"{claim} {date_text}")
+        ]
+        has_future_year = any(year > current_year for year in years)
+        has_forward_language = bool(_FORWARD_LANGUAGE_PATTERN.search(claim))
+        if not has_future_year and not has_forward_language:
+            continue
+
+        if has_future_year and (is_low_trust or not is_primary):
+            confidence_hint = "low"
+        elif has_future_year and is_primary:
+            confidence_hint = "medium"
+        elif has_forward_language and is_primary and not is_low_trust:
+            confidence_hint = "medium"
+        else:
+            confidence_hint = "low"
+
+        reasons: list[str] = []
+        if has_future_year:
+            reasons.append("contains year beyond current date")
+        if has_forward_language:
+            reasons.append("forecast-style wording")
+        if is_low_trust:
+            reasons.append("low-trust source domain")
+        if not is_primary:
+            reasons.append("non-primary source")
+
+        watchlist.append(
+            {
+                "claim": claim,
+                "date": date_text,
+                "source_url": source_url,
+                "confidence_hint": confidence_hint,
+                "reason": ", ".join(reasons) if reasons else "forward-looking claim",
+            }
+        )
+        if len(watchlist) >= max_items:
+            break
+
+    return watchlist
+
+
+def _format_forward_claims_for_prompt(forward_claims: list[dict[str, str]]) -> str:
+    if not forward_claims:
+        return "No explicit forward-looking claims were detected in the evidence ledger."
+
+    rows = []
+    for item in forward_claims:
+        rows.append(
+            " | ".join(
+                [
+                    str(item.get("claim", "")).strip(),
+                    str(item.get("date", "")).strip(),
+                    str(item.get("source_url", "")).strip(),
+                    str(item.get("confidence_hint", "")).strip(),
+                    str(item.get("reason", "")).strip(),
+                ]
+            )
+        )
+
+    header = "claim | date | source_url | confidence_hint | reason"
+    divider = "--- | --- | --- | --- | ---"
+    return "\n".join([header, divider, *rows])
 
 
 def _format_evidence_ledger_for_prompt(evidence_ledger: list[dict], max_items: int = 120) -> str:
@@ -1322,9 +1430,15 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
     cleared_state = {"notes": {"type": "override", "value": []}}
     findings = "\n".join(notes)
+    evidence_ledger = state.get("evidence_ledger", [])
     evidence_ledger_text = _format_evidence_ledger_for_prompt(
-        state.get("evidence_ledger", []),
+        evidence_ledger,
     )
+    forward_claim_watchlist = _extract_forward_claim_watchlist(
+        _curate_evidence_for_prompt(evidence_ledger, max_items=250),
+        max_items=60,
+    )
+    forward_claims_text = _format_forward_claims_for_prompt(forward_claim_watchlist)
     
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
@@ -1349,6 +1463,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 messages=get_buffer_string(state.get("messages", [])),
                 findings=findings,
                 evidence_ledger=evidence_ledger_text,
+                forward_claims=forward_claims_text,
                 date=get_today_str()
             )
             
