@@ -33,6 +33,15 @@ from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 
+# Suppress noisy serializer warnings emitted by pydantic when provider wrappers
+# attach parsed Summary objects to optional metadata fields.
+warnings.filterwarnings(
+    "ignore",
+    message=r"(?s)Pydantic serializer warnings:.*field_name='parsed'.*input_type=Summary.*",
+    category=UserWarning,
+    module=r"pydantic\.main",
+)
+
 ##########################
 # Tavily Search Tool Utils
 ##########################
