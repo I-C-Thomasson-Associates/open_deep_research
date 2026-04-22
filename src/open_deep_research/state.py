@@ -48,6 +48,25 @@ class ResearchQuestion(BaseModel):
     )
 
 
+class ResearchDimensions(BaseModel):
+    """Required research dimensions extracted from the research brief."""
+
+    dimensions: list[str] = Field(
+        description="List of required research dimensions that must be covered before completion.",
+    )
+
+
+class EvidenceItem(BaseModel):
+    """Structured evidence record extracted from researcher findings."""
+
+    claim: str = Field(description="A concrete factual claim supported by a source")
+    entity: str = Field(description="Named entity associated with the claim")
+    date: str = Field(description="Date or date range for the claim, if available")
+    metric: str = Field(description="Numeric figure/value for the claim, if available")
+    source_url: str = Field(description="Primary source URL for this claim")
+    dimension: str = Field(description="Research dimension this claim supports")
+
+
 ###################
 # State Definitions
 ###################
@@ -67,8 +86,11 @@ class AgentState(MessagesState):
     
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: Optional[str]
+    required_dimensions: Annotated[list[str], override_reducer] = []
+    covered_dimensions: Annotated[list[str], override_reducer] = []
     raw_notes: Annotated[list[str], override_reducer] = []
     notes: Annotated[list[str], override_reducer] = []
+    evidence_ledger: Annotated[list[dict], operator.add] = []
     final_report: str
 
 class SupervisorState(TypedDict):
@@ -76,21 +98,28 @@ class SupervisorState(TypedDict):
     
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: str
+    required_dimensions: list[str] = []
+    covered_dimensions: list[str] = []
     notes: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0
+    conduct_research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
+    evidence_ledger: Annotated[list[dict], operator.add] = []
 
 class ResearcherState(TypedDict):
     """State for individual researchers conducting research."""
     
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
     tool_call_iterations: int = 0
+    search_tool_call_count: int = 0
     research_topic: str
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    evidence_ledger: Annotated[list[dict], operator.add] = []
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""
     
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    evidence_ledger: list[EvidenceItem] = Field(default_factory=list)

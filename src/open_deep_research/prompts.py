@@ -76,6 +76,32 @@ Guidelines:
 - If the query is in a specific language, prioritize sources published in that language.
 """
 
+
+extract_dimensions_prompt = """You will be given a research brief. Extract the required research dimensions that must be covered before research can be considered complete.
+
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+Today's date is {date}.
+
+Return dimensions using clear canonical labels. Prefer this taxonomy when relevant:
+- timeline and milestones
+- technical mechanisms and architectures
+- products launched and adoption
+- failed/discontinued products and incidents
+- new technologies and methods
+- economics and market impact
+- regulation and governance
+- deployment and inference engineering
+
+Rules:
+1. Include only dimensions explicitly requested by the user or necessary to satisfy the brief.
+2. Use concise, reusable labels.
+3. Return at least one dimension.
+4. If a required dimension does not fit taxonomy, add "other: <label>".
+"""
+
 lead_researcher_prompt = """You are a research supervisor. Your job is to conduct research by calling the "ConductResearch" tool. For context, today's date is {date}.
 
 <Task>
@@ -92,21 +118,26 @@ You have access to three main tools:
 **CRITICAL: Use think_tool before calling ConductResearch to plan your approach, and after each ConductResearch to assess progress. Do not call think_tool with any other tools in parallel.**
 </Available Tools>
 
-<Instructions>
-Think like a research manager with limited time and resources. Follow these steps:
+<Required Dimensions>
+You must cover all of these dimensions before calling ResearchComplete:
+{required_dimensions}
+</Required Dimensions>
 
-1. **Read the question carefully** - What specific information does the user need?
-2. **Decide how to delegate the research** - Carefully consider the question and decide how to delegate the research. Are there multiple independent directions that can be explored simultaneously?
-3. **After each call to ConductResearch, pause and assess** - Do I have enough to answer? What's still missing?
+<Instructions>
+Think like a research manager who values thoroughness. Follow these steps:
+
+1. **Read the question carefully** - What specific information does the user need? What dimensions are explicitly or implicitly requested?
+2. **Decide how to delegate the research** - Break the work into distinct subtopics. Use multiple parallel agents when there are independent dimensions to explore.
+3. **After each call to ConductResearch, pause and assess** - What is well-covered? What is still missing or shallow?
+4. **Continue researching until all requested dimensions have substantive coverage** - Do not stop at high-level coverage when the user asks for deep analysis.
 </Instructions>
 
 <Hard Limits>
-**Task Delegation Budgets** (Prevent excessive delegation):
-- **Bias towards single agent** - Use single agent for simplicity unless the user request has clear opportunity for parallelization
-- **Stop when you can answer confidently** - Don't keep delegating research for perfection
-- **Limit tool calls** - Always stop after {max_researcher_iterations} tool calls to ConductResearch and think_tool if you cannot find the right sources
-
-**Maximum {max_concurrent_research_units} parallel agents per iteration**
+**Task Delegation Budgets**:
+- You may make up to {max_researcher_iterations} calls to ConductResearch (this budget does not count think_tool calls)
+- You should make at least {min_conduct_research_calls} calls to ConductResearch before completing, unless the question is truly simple
+- **Maximum {max_concurrent_research_units} parallel agents per ConductResearch call**
+- Use think_tool freely for planning and gap analysis
 </Hard Limits>
 
 <Show Your Thinking>
@@ -122,16 +153,20 @@ After each ConductResearch tool call, use think_tool to analyze the results:
 
 <Scaling Rules>
 **Simple fact-finding, lists, and rankings** can use a single sub-agent:
-- *Example*: List the top 10 coffee shops in San Francisco → Use 1 sub-agent
+- *Example*: List the top 10 coffee shops in San Francisco → Use 1 sub-agent, 1 ConductResearch call
+
+**Multi-dimensional research questions** should use multiple agents and multiple ConductResearch calls:
+- If the question asks for technical advances, products, failures, economics, regulation, or tradeoffs, treat these as distinct dimensions and delegate accordingly
+- For broad, multi-dimensional prompts, use 2-{max_concurrent_research_units} parallel agents and multiple ConductResearch calls
 
 **Comparisons presented in the user request** can use a sub-agent for each element of the comparison:
 - *Example*: Compare OpenAI vs. Anthropic vs. DeepMind approaches to AI safety → Use 3 sub-agents
-- Delegate clear, distinct, non-overlapping subtopics
 
 **Important Reminders:**
 - Each ConductResearch call spawns a dedicated research agent for that specific topic
 - A separate agent will write the final report - you just need to gather information
 - When calling ConductResearch, provide complete standalone instructions - sub-agents can't see other agents' work
+- Require concrete specifics from researchers: named examples, dates, figures, and primary sources where available
 - Do NOT use acronyms or abbreviations in your research questions, be very clear and specific
 </Scaling Rules>"""
 
@@ -152,32 +187,33 @@ You have access to two main tools:
 </Available Tools>
 
 <Instructions>
-Think like a human researcher with limited time. Follow these steps:
+Think like a thorough researcher. Follow these steps:
 
 1. **Read the question carefully** - What specific information does the user need?
 2. **Start with broader searches** - Use broad, comprehensive queries first
-3. **After each search, pause and assess** - Do I have enough to answer? What's still missing?
-4. **Execute narrower searches as you gather information** - Fill in the gaps
-5. **Stop when you can answer confidently** - Don't keep searching for perfection
+3. **After each search, pause and assess** - Do you have concrete specifics (names, dates, figures, primary sources), or only general summaries?
+4. **Execute targeted follow-up searches** - Fill gaps using specific entities, incidents, standards, papers, or official documents
+5. **Prioritize primary sources** - Prefer original papers, official announcements, and government/regulatory documents when available
+6. **Stop when coverage is substantive** - Avoid shallow overviews when specifics are available
 </Instructions>
 
 <Hard Limits>
-**Tool Call Budgets** (Prevent excessive searching):
-- **Simple queries**: Use 2-3 search tool calls maximum
-- **Complex queries**: Use up to 5 search tool calls maximum
-- **Always stop**: After 5 search tool calls if you cannot find the right sources
+**Tool Call Budgets** (search/tool calls only; think_tool does not count):
+- **Simple queries**: Use 2-4 search tool calls
+- **Complex queries**: Use up to {max_react_tool_calls} search tool calls
+- **Always stop**: After {max_react_tool_calls} search tool calls if you cannot find more relevant sources
 
-**Stop Immediately When**:
-- You can answer the user's question comprehensively
-- You have 3+ relevant examples/sources for the question
-- Your last 2 searches returned similar information
+**Stop When**:
+- You have specific, detailed information with credible sources for the assigned topic
+- You have concrete named examples (companies, products, incidents, dates, figures), not just category-level descriptions
+- Additional searches are returning diminishing new information
 </Hard Limits>
 
 <Show Your Thinking>
 After each search tool call, use think_tool to analyze the results:
-- What key information did I find?
-- What's missing?
-- Do I have enough to answer the question comprehensively?
+- What concrete specifics did I find (names, dates, figures, source types)?
+- What's still missing?
+- Are there primary sources I should search for directly?
 - Should I search more or provide my answer?
 </Show Your Thinking>
 """
@@ -187,19 +223,19 @@ compress_research_system_prompt = """You are a research assistant that has condu
 
 <Task>
 You need to clean up information gathered from tool calls and web searches in the existing messages.
-All relevant information should be repeated and rewritten verbatim, but in a cleaner format.
-The purpose of this step is just to remove any obviously irrelevant or duplicative information.
-For example, if three sources all say "X", you could say "These three sources all stated X".
-Only these fully comprehensive cleaned findings are going to be returned to the user, so it's crucial that you don't lose any information from the raw messages.
+Preserve all claim-relevant evidence, but remove irrelevant noise and low-signal repetition.
+The purpose of this step is to produce high-fidelity, auditable findings that keep concrete evidence while dropping weak filler.
+For example, if three credible sources all say "X", you can preserve that once and list supporting citations.
 </Task>
 
 <Guidelines>
-1. Your output findings should be fully comprehensive and include ALL of the information and sources that the researcher has gathered from tool calls and web searches. It is expected that you repeat key information verbatim.
-2. This report can be as long as necessary to return ALL of the information that the researcher has gathered.
+1. Your output findings should be comprehensive and preserve all claim-relevant evidence from the research messages.
+2. Keep findings detailed, but remove irrelevant, duplicative, or weakly supported content.
 3. In your report, you should return inline citations for each source that the researcher found.
-4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
-5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
-6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
+4. Include a "Sources" section at the end of the report that lists only sources used to support concrete claims.
+5. Prefer primary/official sources when available; use secondary sources only when they add unique evidence.
+6. Do not preserve noisy links just because they appeared in tool output.
+7. Extract concrete, structured evidence records from the findings.
 </Guidelines>
 
 <Output Format>
@@ -207,7 +243,24 @@ The report should be structured like this:
 **List of Queries and Tool Calls Made**
 **Fully Comprehensive Findings**
 **List of All Relevant Sources (with citations in the report)**
+**Evidence Ledger (JSON Array)**
 </Output Format>
+
+<Evidence Ledger JSON Requirements>
+- After your prose report, include a markdown heading exactly: `### Evidence Ledger (JSON)`.
+- Under that heading, output a JSON array inside a ```json fenced block.
+- Include up to 30 items.
+- Every item must include:
+  - claim
+  - entity
+  - date
+  - metric
+  - source_url
+  - dimension
+- Use empty strings when date/metric are unavailable.
+- Prefer primary sources for source_url when available.
+- Do not include low-trust/aggregator links in source_url when a stronger source exists for the same claim.
+</Evidence Ledger JSON Requirements>
 
 <Citation Rules>
 - Assign each unique URL a single citation number in your text
@@ -218,7 +271,7 @@ The report should be structured like this:
   [2] Source Title: URL
 </Citation Rules>
 
-Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
+Critical Reminder: Preserve evidence quality and claim traceability. Keep concrete evidence, avoid noisy source dumping.
 """
 
 compress_research_simple_human_message = """All above messages are about research conducted by an AI Researcher. Please clean up these findings.
@@ -245,12 +298,44 @@ Here are the findings from the research that you conducted:
 {findings}
 </Findings>
 
+Here is the structured evidence ledger extracted from sub-researchers:
+<EvidenceLedger>
+{evidence_ledger}
+</EvidenceLedger>
+
+Potentially forward-looking or forecast-style claims detected in evidence:
+<ForwardLookingClaims>
+{forward_claims}
+</ForwardLookingClaims>
+
+<Analytical Quality Requirements>
+The report must meet these quality standards:
+
+1. **Analyze, don't just compile.** Explain why developments happened, what tradeoffs they reveal, and what they imply.
+2. **Use specific named examples.** Prefer concrete entities, dates, figures, standards, and incidents over vague statements.
+3. **Prioritize primary sources.** Use original papers, official announcements, and government documents whenever available.
+4. **Connect sections.** Explicitly connect technical changes to products, failures, costs, and governance where relevant.
+5. **Be precise about uncertainty.** Distinguish established facts from weakly supported claims.
+6. **Use structure for comparison.** Use markdown tables when comparing three or more items across shared dimensions.
+</Analytical Quality Requirements>
+
+<Forward-Looking Confidence Rules>
+- If a claim is forward-looking, forecast-based, or dated beyond today's date, label it explicitly as a forecast/projection.
+- Do NOT state forward-looking claims as established facts.
+- For forward-looking claims, add confidence tags such as (confidence: high/medium/low) based on source strength.
+- Use lower confidence when evidence is secondary, low-trust, or conflicting.
+- If a forecast claim is weakly supported, keep it brief and clearly caveated.
+</Forward-Looking Confidence Rules>
+
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
-2. Includes specific facts and insights from the research
-3. References relevant sources using [Title](URL) format
-4. Provides a balanced, thorough analysis. Be as comprehensive as possible, and include all information that is relevant to the overall research question. People are using you for deep research and will expect detailed, comprehensive answers.
-5. Includes a "Sources" section at the end with all referenced links
+2. Includes specific facts, figures, dates, and named examples from the research
+3. References relevant sources with precise inline citations that map to the Sources list
+4. Provides analytical, thorough coverage. Include interpretation and cross-section connections, not only descriptive summaries.
+5. Includes a "Sources" section at the end with all referenced links, using exact URLs
+6. Uses the Evidence Ledger to ensure concrete claims are represented, especially for failures/incidents, launches, and quantitative evidence
+7. Every major concrete claim (named launch/failure/date/metric) should be traceable to at least one ledger item or cited source.
+8. Prioritize primary/official sources; if only weaker sources are available, explicitly mark the claim as lower-confidence.
 
 You can structure your report in a number of different ways. Here are some examples:
 
@@ -301,9 +386,11 @@ Format the report in clear markdown with proper structure and include source ref
 - IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
 - Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
 - Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
+  [1] https://example.com/first-source
+  [2] https://example.com/second-source
 - Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+- Keep citation quality high: do not cite low-trust/aggregator links for core claims when primary sources are available.
+- Do not pair a source title/domain label with a different URL. If unsure, output only the exact URL.
 </Citation Rules>
 """
 
