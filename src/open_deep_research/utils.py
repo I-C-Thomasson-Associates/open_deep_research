@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
+from open_deep_research.env import get_secret
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -918,14 +919,21 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("GOOGLE_API_KEY")
         return None
     else:
-        if model_name.startswith("openai:"): 
-            return os.getenv("OPENAI_API_KEY")
+        if model_name.startswith("openai:"):
+            return get_secret("OPENAI_API_KEY") or None
         elif model_name.startswith("azure_openai:"):
-            return os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+            # KV holds this as FOUNDRY-API-KEY; try the natural name first,
+            # then the legacy vault name, then OPENAI_API_KEY as a final fallback.
+            return (
+                get_secret("AZURE_OPENAI_API_KEY")
+                or get_secret("FOUNDRY_API_KEY")
+                or get_secret("OPENAI_API_KEY")
+                or None
+            )
         elif model_name.startswith("anthropic:"):
-            return os.getenv("ANTHROPIC_API_KEY")
+            return get_secret("ANTHROPIC_API_KEY") or None
         elif model_name.startswith("google"):
-            return os.getenv("GOOGLE_API_KEY")
+            return get_secret("GOOGLE_API_KEY") or None
         return None
 
 def get_tavily_api_key(config: RunnableConfig):
@@ -937,4 +945,4 @@ def get_tavily_api_key(config: RunnableConfig):
             return None
         return api_keys.get("TAVILY_API_KEY")
     else:
-        return os.getenv("TAVILY_API_KEY")
+        return get_secret("TAVILY_API_KEY") or None

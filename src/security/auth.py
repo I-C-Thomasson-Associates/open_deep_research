@@ -1,12 +1,13 @@
-import os
 import asyncio
 from langgraph_sdk import Auth
 from langgraph_sdk.auth.types import StudioUser
 from supabase import create_client, Client
 from typing import Optional, Any
 
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_KEY")
+from open_deep_research.env import get_secret
+
+supabase_url = get_secret("SUPABASE_URL") or None
+supabase_key = get_secret("SUPABASE_KEY") or None
 supabase: Optional[Client] = None
 
 if supabase_url and supabase_key:
