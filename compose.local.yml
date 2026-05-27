@@ -1,0 +1,87 @@
+# Local end-to-end pipeline mirror of the AKS deployment.
+# Same image, same env-var contract, same init-container ordering as the
+# Kubernetes Deployment in sobe-aifoundry-infrastructure/dev/kubernetes.tf.
+#
+# Usage:
+#   1. Populate .env with AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
+#      and TAVILY_API_KEY (see .env.example for template).
+#   2. docker compose -f compose.local.yml up --build
+#   3. Aegra API at http://localhost:2024 (health: /live, /ready, /info)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: odr-postgres
+    environment:
+      POSTGRES_USER: aegra
+      POSTGRES_PASSWORD: aegra
+      POSTGRES_DB: deep_research
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegra -d deep_research"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    tmpfs:
+      - /var/lib/postgresql/data # ephemeral; matches the AKS "fresh DB" model
+
+  redis:
+    image: valkey/valkey:8.0.1-alpine
+    container_name: odr-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  open-deep-research-migrate:
+    container_name: odr-migrate
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: open-deep-research:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://aegra:aegra@postgres:5432/deep_research?sslmode=disable
+    command: ["aegra", "db", "upgrade"]
+    restart: "no"
+
+  open-deep-research:
+    container_name: open-deep-research
+    image: open-deep-research:local
+    depends_on:
+      open-deep-research-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    ports:
+      - "2024:2024"
+    env_file:
+      - .env
+    environment:
+      # Database + Redis (override .env so local always wins)
+      DATABASE_URL: postgresql://aegra:aegra@postgres:5432/deep_research?sslmode=disable
+      REDIS_URL: redis://redis:6379/3
+      REDIS_BROKER_ENABLED: "true"
+
+      # Runtime config (matches kubernetes.tf)
+      ENV_MODE: PRODUCTION
+      LOG_LEVEL: INFO
+      RUN_MIGRATIONS_ON_STARTUP: "false"
+      WORKER_COUNT: "2"
+      N_JOBS_PER_WORKER: "6"
+      BG_JOB_TIMEOUT_SECS: "1800"
+      LEASE_DURATION_SECONDS: "60"
+      HEARTBEAT_INTERVAL_SECONDS: "20"
+
+      # Application config
+      SEARCH_API: tavily
+      AZURE_OPENAI_API_VERSION: "2024-12-01-preview"
+      LANGCHAIN_TRACING_V2: "false"
+      LANGSMITH_TRACING: "false"
+    restart: unless-stopped

@@ -48,6 +48,20 @@ COPY README.md ./README.md
 
 RUN pip install --no-cache-dir .
 
+# Patch aegra-api 0.9.17's broken sslmode -> asyncpg translation.
+# Upstream maps sslmode=require -> ssl=true (the literal string), but asyncpg
+# rejects 'true' as an SSLMode value. The fix is identity-mapping the mode
+# name; remove this patch when aegra-api ships a real fix in 0.9.18+.
+RUN sed -i \
+    -e 's|"disable": "false",|"disable": "disable",|' \
+    -e 's|"allow": "false",|"allow": "allow",|' \
+    -e 's|"prefer": "false",|"prefer": "prefer",|' \
+    -e 's|"require": "true",|"require": "require",|' \
+    -e 's|"verify-ca": "true",|"verify-ca": "verify-ca",|' \
+    -e 's|"verify-full": "true",|"verify-full": "verify-full",|' \
+    /usr/local/lib/python3.12/site-packages/aegra_api/settings.py \
+    && python -c "from aegra_api.settings import _SSLMODE_TO_ASYNCPG; assert _SSLMODE_TO_ASYNCPG['require'] == 'require', _SSLMODE_TO_ASYNCPG; print('aegra sslmode patch applied:', _SSLMODE_TO_ASYNCPG)"
+
 # -----------------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
