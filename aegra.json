@@ -1,0 +1,5 @@
+{
+  "graphs": {
+    "Deep Researcher": "open_deep_research.deep_researcher:deep_researcher"
+  }
+}

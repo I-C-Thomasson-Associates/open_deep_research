@@ -1,50 +1,80 @@
 # =============================================================================
-# DOCKERFILE - Open Deep Research (LangGraph API)
+# DOCKERFILE - Open Deep Research (Aegra runtime)
 # =============================================================================
-# Inherits from the official LangGraph Platform API image, which ships the Go
-# gRPC persistence binary required for the Postgres runtime. When POSTGRES_URI
-# is set at runtime the container automatically selects the Postgres runtime
-# (multi-worker + multi-pod safe via shared state); otherwise it falls back to
-# the in-memory runtime for local single-process use.
+# Builds a self-hosted Aegra image. Aegra (Apache 2.0) is a drop-in replacement
+# for the LangGraph Platform runtime; it implements the Agent Protocol API,
+# manages a Redis-backed job queue with Postgres-checkpointed durability, and
+# supports horizontal scaling across pods via lease-based crash recovery.
 #
-# The base image already provides:
-#   - Non-root runtime user
-#   - Healthcheck on http://localhost:2024/ok
-#   - Entrypoint that honors POSTGRES_URI, REDIS_URI, WEB_CONCURRENCY,
-#     N_JOBS_PER_WORKER, LANGSERVE_GRAPHS, BG_JOB_TIMEOUT_SECS, and the
-#     LANGSMITH_* / LANGGRAPH_* air-gap toggles.
+# Required runtime env vars (set by Kubernetes Deployment in
+# sobe-aifoundry-infrastructure/dev/kubernetes.tf):
+#   DATABASE_URL              -- postgres://user:pwd@host:5432/deep_research?sslmode=require
+#   REDIS_URL                 -- redis://redis:6379/3
+#   REDIS_BROKER_ENABLED=true -- enables Redis BLPOP dispatch (vs Postgres polling)
+#   WORKER_COUNT              -- async workers per pod (we use 2)
+#   N_JOBS_PER_WORKER         -- concurrent jobs per worker (we use 6 -> 12/pod)
+#   LEASE_DURATION_SECONDS    -- worker heartbeat lease (30)
+#   HEARTBEAT_INTERVAL_SECONDS-- heartbeat cadence (10)
+#   RUN_MIGRATIONS_ON_STARTUP -- false; an init container runs alembic upgrade
+#   VAULT_HOST, AZURE_CLIENT_ID
+#                             -- bootstrap for src/open_deep_research/env.py
+#   AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, SEARCH_API,
+#   GET_API_KEYS_FROM_CONFIG  -- non-secret application config
 #
 # Build:  docker build -t open-deep-research .
 # Run:    docker run -p 2024:2024 --env-file .env open-deep-research
-# Health: GET http://localhost:2024/ok -> {"ok": true}
+# Health: GET http://localhost:2024/live -> {"status":"ok"}
 # =============================================================================
 
-FROM langchain/langgraph-api:3.11
+FROM python:3.12-slim AS builder
 
-# Copy project sources into the standard LangGraph Platform deps path so that
-# `pip install -e` keeps the graph module importable under the path declared in
-# LANGSERVE_GRAPHS below.
-ADD ./pyproject.toml /deps/open-deep-research/pyproject.toml
-ADD ./uv.lock /deps/open-deep-research/uv.lock
-ADD ./langgraph.json /deps/open-deep-research/langgraph.json
-ADD ./src /deps/open-deep-research/src
-ADD ./README.md /deps/open-deep-research/README.md
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install the project against the base image's pinned constraints. The
-# constraints file ensures langgraph / langgraph-api / langsmith stay aligned
-# with the Go runtime in the base image and avoids accidental upgrades from
-# our own pyproject pins.
-RUN PYTHONDONTWRITEBYTECODE=1 \
-    pip install --no-cache-dir -c /api/constraints.txt -e /deps/open-deep-research
+WORKDIR /app
 
-# Advertise the graph to the platform entrypoint. Key is the user-facing graph
-# name ("Deep Researcher"); value is the import path.
-ENV LANGSERVE_GRAPHS='{"Deep Researcher": "/deps/open-deep-research/src/open_deep_research/deep_researcher.py:deep_researcher"}'
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Keep long-running research jobs from being culled by the default timeout.
-# Can be overridden at deploy time via the Kubernetes env var of the same name.
-ENV BG_JOB_TIMEOUT_SECS=1800
+COPY pyproject.toml ./
+COPY src ./src
+COPY aegra.json ./aegra.json
+COPY langgraph.json ./langgraph.json
+COPY README.md ./README.md
 
-WORKDIR /deps/open-deep-research
+RUN pip install --no-cache-dir .
+
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    AEGRA_CONFIG=/app/aegra.json \
+    PORT=2024
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /app /app
+
+RUN groupadd --system aegra \
+    && useradd --system --gid aegra --create-home --shell /bin/bash aegra \
+    && chown -R aegra:aegra /app
+USER aegra
 
 EXPOSE 2024
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:2024/live || exit 1
+
+CMD ["aegra", "serve", "--host", "0.0.0.0", "--port", "2024", "--config", "/app/aegra.json"]
