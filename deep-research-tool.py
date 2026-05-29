@@ -614,7 +614,7 @@ class Tools:
         )
         SEARCH_API: str = Field(
             default="tavily",
-            description="Search API to use (tavily, openai, anthropic, none)",
+            description="Search API to use (tavily, firecrawl, openai, anthropic, none)",
         )
         ON_DISCONNECT: str = Field(
             default="continue",
@@ -1251,7 +1251,7 @@ class Tools:
 
     def _normalize_search_api(self, search_api: str) -> str:
         raw = str(search_api or "").strip().lower()
-        allowed = {"tavily", "openai", "anthropic", "none"}
+        allowed = {"tavily", "firecrawl", "openai", "anthropic", "none"}
         return raw if raw in allowed else "tavily"
 
     def _normalize_on_disconnect(self, value: str) -> str:

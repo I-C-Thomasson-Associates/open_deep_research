@@ -25,10 +25,11 @@ from langchain_core.tools import (
     ToolException,
     tool,
 )
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.config import get_store
-from mcp import McpError
-from tavily import AsyncTavilyClient
+# Provider SDKs (langchain_mcp_adapters, mcp, tavily, firecrawl) are imported
+# lazily inside the functions that need them so partial deployments (e.g.,
+# Tavily-only or Firecrawl-only) and local smoke tests don't have to install
+# every search/MCP provider package.
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
@@ -44,54 +45,39 @@ warnings.filterwarnings(
 )
 
 ##########################
-# Tavily Search Tool Utils
+# Web Search Tool Utils (Tavily + Firecrawl)
 ##########################
-TAVILY_SEARCH_DESCRIPTION = (
+WEB_SEARCH_DESCRIPTION = (
     "A search engine optimized for comprehensive, accurate, and trusted results. "
     "Useful for when you need to answer questions about current events."
 )
-@tool(description=TAVILY_SEARCH_DESCRIPTION)
-async def tavily_search(
-    queries: List[str],
-    max_results: Annotated[int, InjectedToolArg] = 5,
-    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
-    config: RunnableConfig = None
+
+
+async def _summarize_and_format_search_results(
+    search_results: List[Dict[str, Any]],
+    config: RunnableConfig,
 ) -> str:
-    """Fetch and summarize search results from Tavily search API.
+    """Dedup, summarize, and format a list of provider-agnostic search responses.
 
-    Args:
-        queries: List of search queries to execute
-        max_results: Maximum number of results to return per query
-        topic: Topic filter for search results (general, news, or finance)
-        config: Runtime configuration for API keys and model settings
+    Each response in ``search_results`` is shaped as::
 
-    Returns:
-        Formatted string containing summarized search results
+        {"query": str, "results": [{"url", "title", "content", "raw_content"}, ...]}
+
+    This shape is produced by both ``tavily_search_async`` and
+    ``firecrawl_search_async`` so the post-search pipeline can be shared.
     """
-    # Step 1: Execute search queries asynchronously
-    search_results = await tavily_search_async(
-        queries,
-        max_results=max_results,
-        topic=topic,
-        include_raw_content=True,
-        config=config
-    )
-    
-    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
-    unique_results = {}
+    # Step 1: Deduplicate results by URL to avoid processing the same content multiple times
+    unique_results: Dict[str, Dict[str, Any]] = {}
     for response in search_results:
         for result in response['results']:
             url = result['url']
             if url not in unique_results:
                 unique_results[url] = {**result, "query": response['query']}
-    
-    # Step 3: Set up the summarization model with configuration
+
+    # Step 2: Set up the summarization model with configuration
     configurable = Configuration.from_runnable_config(config)
-    
-    # Character limit to stay within model token limits (configurable)
     max_char_to_include = configurable.max_content_length
-    
-    # Initialize summarization model with retry logic
+
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     summarization_model = init_chat_model(
         model=configurable.summarization_model,
@@ -102,49 +88,99 @@ async def tavily_search(
     ).with_structured_output(Summary).with_retry(
         stop_after_attempt=configurable.max_structured_output_retries
     )
-    
-    # Step 4: Create summarization tasks (skip empty content)
+
+    # Step 3: Create summarization tasks (skip empty content)
     async def noop():
         """No-op function for results without raw content."""
         return None
-    
+
     summarization_tasks = [
-        noop() if not result.get("raw_content") 
+        noop() if not result.get("raw_content")
         else summarize_webpage(
-            summarization_model, 
+            summarization_model,
             result['raw_content'][:max_char_to_include]
         )
         for result in unique_results.values()
     ]
-    
-    # Step 5: Execute all summarization tasks in parallel
+
+    # Step 4: Execute all summarization tasks in parallel
     summaries = await asyncio.gather(*summarization_tasks)
-    
-    # Step 6: Combine results with their summaries
+
+    # Step 5: Combine results with their summaries
     summarized_results = {
         url: {
-            'title': result['title'], 
+            'title': result['title'],
             'content': result['content'] if summary is None else summary
         }
         for url, result, summary in zip(
-            unique_results.keys(), 
-            unique_results.values(), 
+            unique_results.keys(),
+            unique_results.values(),
             summaries
         )
     }
-    
-    # Step 7: Format the final output
+
+    # Step 6: Format the final output
     if not summarized_results:
         return "No valid search results found. Please try different search queries or use a different search API."
-    
+
     formatted_output = "Search results: \n\n"
     for i, (url, result) in enumerate(summarized_results.items()):
         formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
         formatted_output += f"URL: {url}\n\n"
         formatted_output += f"SUMMARY:\n{result['content']}\n\n"
         formatted_output += "\n\n" + "-" * 80 + "\n"
-    
+
     return formatted_output
+
+
+@tool("web_search", description=WEB_SEARCH_DESCRIPTION)
+async def tavily_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
+    config: RunnableConfig = None
+) -> str:
+    """Fetch and summarize web search results via Tavily.
+
+    Args:
+        queries: List of search queries to execute
+        max_results: Maximum number of results to return per query
+        topic: Topic filter for search results (general, news, or finance)
+        config: Runtime configuration for API keys and model settings
+
+    Returns:
+        Formatted string containing summarized search results
+    """
+    search_results = await tavily_search_async(
+        queries,
+        max_results=max_results,
+        topic=topic,
+        include_raw_content=True,
+        config=config
+    )
+    return await _summarize_and_format_search_results(search_results, config)
+
+
+@tool("web_search", description=WEB_SEARCH_DESCRIPTION)
+async def firecrawl_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
+    config: RunnableConfig = None
+) -> str:
+    """Fetch and summarize web search results via Firecrawl.
+
+    ``topic`` is accepted for interface parity with the Tavily tool but is not
+    forwarded to Firecrawl (Firecrawl uses ``tbs``/``location`` instead and we
+    don't surface those yet).
+    """
+    search_results = await firecrawl_search_async(
+        queries,
+        max_results=max_results,
+        config=config,
+    )
+    return await _summarize_and_format_search_results(search_results, config)
+
 
 async def tavily_search_async(
     search_queries, 
@@ -165,6 +201,8 @@ async def tavily_search_async(
     Returns:
         List of search result dictionaries from Tavily API
     """
+    from tavily import AsyncTavilyClient
+
     # Initialize the Tavily client with API key from config
     tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
     
@@ -182,6 +220,120 @@ async def tavily_search_async(
     # Execute all search queries in parallel and return results
     search_results = await asyncio.gather(*search_tasks)
     return search_results
+
+
+def _firecrawl_web_results(response: Any) -> List[Any]:
+    """Extract the web-results list from a Firecrawl search response.
+
+    Handles both attribute-style (pydantic) and dict-style (raw JSON) responses
+    across SDK major versions.
+    """
+    web = getattr(response, "web", None)
+    if web is not None:
+        return list(web)
+    data = getattr(response, "data", None)
+    if data is not None:
+        web = getattr(data, "web", None)
+        if web is not None:
+            return list(web)
+    if isinstance(response, dict):
+        if "web" in response and response["web"] is not None:
+            return list(response["web"])
+        data = response.get("data") or {}
+        if isinstance(data, dict):
+            return list(data.get("web") or [])
+    return []
+
+
+def _firecrawl_item_get(item: Any, key: str, default: Any = None) -> Any:
+    """Get a field from a Firecrawl result item (object or dict)."""
+    if hasattr(item, key):
+        return getattr(item, key, default)
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return default
+
+
+def _firecrawl_meta_get(item: Any, key: str, default: Any = None) -> Any:
+    """Get a field from a Firecrawl result item's ``metadata`` sub-object.
+
+    v4 SDK moved url/title/description from top-level fields into ``.metadata``;
+    this helper unwraps either a pydantic object or a dict.
+    """
+    meta = _firecrawl_item_get(item, "metadata")
+    if meta is None:
+        return default
+    if hasattr(meta, key):
+        return getattr(meta, key, default)
+    if isinstance(meta, dict):
+        return meta.get(key, default)
+    return default
+
+
+async def firecrawl_search_async(
+    search_queries,
+    max_results: int = 5,
+    config: RunnableConfig = None,
+):
+    """Execute multiple Firecrawl search queries in parallel.
+
+    Returns results in the same shape as ``tavily_search_async`` so the shared
+    post-processing pipeline can consume either provider transparently::
+
+        [{"query": str, "results": [{"url", "title", "content", "raw_content"}]}]
+
+    ``raw_content`` is populated from Firecrawl's scraped markdown when
+    available; ``content`` is the search-result description/snippet.
+    """
+    from firecrawl import AsyncFirecrawl
+
+    firecrawl_client = AsyncFirecrawl(api_key=get_firecrawl_api_key(config))
+
+    search_tasks = [
+        firecrawl_client.search(
+            query=query,
+            limit=max_results,
+            scrape_options={"formats": ["markdown"]},
+        )
+        for query in search_queries
+    ]
+
+    firecrawl_responses = await asyncio.gather(*search_tasks)
+
+    normalized: List[Dict[str, Any]] = []
+    for query, response in zip(search_queries, firecrawl_responses):
+        items = _firecrawl_web_results(response)
+        results = []
+        for item in items:
+            # v4 SDK keeps url/title/description under .metadata, while v2 has
+            # them at the top level. Try top-level first, then fall back to
+            # metadata.{url|sourceURL,title,description}.
+            url = (
+                _firecrawl_item_get(item, "url")
+                or _firecrawl_meta_get(item, "url")
+                or _firecrawl_meta_get(item, "sourceURL")
+                or _firecrawl_meta_get(item, "source_url")
+            )
+            if not url:
+                continue
+            results.append({
+                "url": url,
+                "title": (
+                    _firecrawl_item_get(item, "title")
+                    or _firecrawl_meta_get(item, "title")
+                    or ""
+                ),
+                "content": (
+                    _firecrawl_item_get(item, "description")
+                    or _firecrawl_meta_get(item, "description")
+                    or _firecrawl_item_get(item, "summary")
+                    or ""
+                ),
+                "raw_content": _firecrawl_item_get(item, "markdown"),
+            })
+        normalized.append({"query": query, "results": results})
+    return normalized
+
 
 async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
     """Summarize webpage content using AI model with timeout protection.
@@ -395,18 +547,20 @@ async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
 
 def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
     """Wrap MCP tool with comprehensive authentication and error handling.
-    
+
     Args:
         tool: The MCP structured tool to wrap
-        
+
     Returns:
         Enhanced tool with authentication error handling
     """
+    from mcp import McpError
+
     original_coroutine = tool.coroutine
-    
+
     async def authentication_wrapper(**kwargs):
         """Enhanced coroutine with MCP error handling and user-friendly messages."""
-        
+
         def _find_mcp_error_in_exception_chain(exc: BaseException) -> McpError | None:
             """Recursively search for MCP errors in exception chains."""
             if isinstance(exc, McpError):
@@ -508,6 +662,8 @@ async def load_mcp_tools(
     
     # Step 4: Load tools from MCP server
     try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
         client = MultiServerMCPClient(mcp_server_config)
         available_mcp_tools = await client.get_tools()
     except Exception:
@@ -541,39 +697,46 @@ async def load_mcp_tools(
 
 async def get_search_tool(search_api: SearchAPI):
     """Configure and return search tools based on the specified API provider.
-    
+
     Args:
-        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, or None)
-        
+        search_api: The search API provider to use (Anthropic, OpenAI, Tavily,
+            Firecrawl, or None)
+
     Returns:
         List of configured search tool objects for the specified provider
     """
     if search_api == SearchAPI.ANTHROPIC:
         # Anthropic's native web search with usage limits
         return [{
-            "type": "web_search_20250305", 
-            "name": "web_search", 
+            "type": "web_search_20250305",
+            "name": "web_search",
             "max_uses": 5
         }]
-        
+
     elif search_api == SearchAPI.OPENAI:
         # OpenAI's web search preview functionality
         return [{"type": "web_search_preview"}]
-        
+
     elif search_api == SearchAPI.TAVILY:
-        # Configure Tavily search tool with metadata
         search_tool = tavily_search
         search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
-            "name": "web_search"
+            **(search_tool.metadata or {}),
+            "type": "search",
         }
         return [search_tool]
-        
+
+    elif search_api == SearchAPI.FIRECRAWL:
+        search_tool = firecrawl_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "type": "search",
+        }
+        return [search_tool]
+
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
         return []
-        
+
     # Default fallback for unknown search API types
     return []
     
@@ -946,3 +1109,15 @@ def get_tavily_api_key(config: RunnableConfig):
         return api_keys.get("TAVILY_API_KEY")
     else:
         return get_secret("TAVILY_API_KEY") or None
+
+
+def get_firecrawl_api_key(config: RunnableConfig):
+    """Get Firecrawl API key from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return None
+        return api_keys.get("FIRECRAWL_API_KEY")
+    else:
+        return get_secret("FIRECRAWL_API_KEY") or None
